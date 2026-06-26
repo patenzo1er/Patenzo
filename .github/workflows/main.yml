@@ -1,0 +1,1348 @@
+# stock_manager_app.py
+# Stock Manager v1.0 - Par Patenzo Premier
+# Adapté pour le marché camerounais (Android & Windows)
+
+import sqlite3
+import json
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+import hashlib
+import os
+
+# ============================================
+# 1. BASE DE DONNÉES
+# ============================================
+
+class DatabaseManager:
+    """Gestion de la base de données SQLite"""
+    
+    def __init__(self, db_path="stock_manager.db"):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """Initialiser la base de données"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Table Utilisateurs
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS utilisateurs (
+                id INTEGER PRIMARY KEY,
+                nom TEXT NOT NULL,
+                email TEXT UNIQUE,
+                telephone TEXT,
+                mot_de_passe TEXT NOT NULL,
+                role TEXT DEFAULT 'employe',
+                devise TEXT DEFAULT 'FCFA',
+                entreprise TEXT,
+                date_creation TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                actif BOOLEAN DEFAULT 1
+            )
+        ''')
+        
+        # Table Produits
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS produits (
+                id INTEGER PRIMARY KEY,
+                code_produit TEXT UNIQUE NOT NULL,
+                nom TEXT NOT NULL,
+                description TEXT,
+                categorie TEXT,
+                prix_achat REAL,
+                prix_vente REAL,
+                quantite_stock INTEGER DEFAULT 0,
+                quantite_min INTEGER DEFAULT 5,
+                quantite_max INTEGER DEFAULT 100,
+                unite TEXT DEFAULT 'pce',
+                fournisseur_id INTEGER,
+                date_ajout TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                date_modification TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                actif BOOLEAN DEFAULT 1
+            )
+        ''')
+        
+        # Table Mouvements de Stock
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS mouvements_stock (
+                id INTEGER PRIMARY KEY,
+                produit_id INTEGER NOT NULL,
+                type_mouvement TEXT NOT NULL,
+                quantite INTEGER NOT NULL,
+                prix_unitaire REAL,
+                utilisateur_id INTEGER NOT NULL,
+                date_mouvement TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                raison TEXT,
+                reference TEXT,
+                FOREIGN KEY (produit_id) REFERENCES produits(id),
+                FOREIGN KEY (utilisateur_id) REFERENCES utilisateurs(id)
+            )
+        ''')
+        
+        # Table Fournisseurs
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS fournisseurs (
+                id INTEGER PRIMARY KEY,
+                nom TEXT NOT NULL,
+                contact TEXT,
+                telephone TEXT,
+                email TEXT,
+                adresse TEXT,
+                ville TEXT,
+                code_postal TEXT,
+                pays TEXT DEFAULT 'Cameroun',
+                conditions_paiement TEXT,
+                date_ajout TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Table Ventes
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ventes (
+                id INTEGER PRIMARY KEY,
+                numero_facture TEXT UNIQUE NOT NULL,
+                client_nom TEXT,
+                client_contact TEXT,
+                date_vente TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                montant_total REAL,
+                montant_paye REAL DEFAULT 0,
+                statut TEXT DEFAULT 'en_cours',
+                utilisateur_id INTEGER,
+                notes TEXT,
+                FOREIGN KEY (utilisateur_id) REFERENCES utilisateurs(id)
+            )
+        ''')
+        
+        # Table Détails Ventes
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS details_ventes (
+                id INTEGER PRIMARY KEY,
+                vente_id INTEGER NOT NULL,
+                produit_id INTEGER NOT NULL,
+                quantite INTEGER NOT NULL,
+                prix_unitaire REAL,
+                montant REAL,
+                FOREIGN KEY (vente_id) REFERENCES ventes(id),
+                FOREIGN KEY (produit_id) REFERENCES produits(id)
+            )
+        ''')
+        
+        # Table Achats
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS achats (
+                id INTEGER PRIMARY KEY,
+                numero_bon TEXT UNIQUE NOT NULL,
+                fournisseur_id INTEGER NOT NULL,
+                date_achat TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                montant_total REAL,
+                montant_paye REAL DEFAULT 0,
+                statut TEXT DEFAULT 'en_cours',
+                utilisateur_id INTEGER,
+                date_livraison TIMESTAMP,
+                FOREIGN KEY (fournisseur_id) REFERENCES fournisseurs(id),
+                FOREIGN KEY (utilisateur_id) REFERENCES utilisateurs(id)
+            )
+        ''')
+        
+        # Table Détails Achats
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS details_achats (
+                id INTEGER PRIMARY KEY,
+                achat_id INTEGER NOT NULL,
+                produit_id INTEGER NOT NULL,
+                quantite INTEGER NOT NULL,
+                prix_unitaire REAL,
+                montant REAL,
+                FOREIGN KEY (achat_id) REFERENCES achats(id),
+                FOREIGN KEY (produit_id) REFERENCES produits(id)
+            )
+        ''')
+        
+        # Table Alertes Stock
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS alertes_stock (
+                id INTEGER PRIMARY KEY,
+                produit_id INTEGER NOT NULL,
+                type_alerte TEXT,
+                quantite_actuelle INTEGER,
+                seuil INTEGER,
+                date_alerte TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                resolue BOOLEAN DEFAULT 0,
+                FOREIGN KEY (produit_id) REFERENCES produits(id)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def get_connection(self):
+        """Obtenir une connexion à la base de données"""
+        return sqlite3.connect(self.db_path)
+
+# ============================================
+# 2. AUTHENTIFICATION & UTILISATEURS
+# ============================================
+
+class UtilisateurManager:
+    """Gestion des utilisateurs"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+    
+    @staticmethod
+    def hash_password(password: str) -> str:
+        """Hasher le mot de passe"""
+        return hashlib.sha256(password.encode()).hexdigest()
+    
+    def creer_utilisateur(self, nom: str, email: str, telephone: str, 
+                         mot_de_passe: str, role: str = 'employe', 
+                         entreprise: str = '') -> Dict:
+        """Créer un nouvel utilisateur"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            mot_de_passe_hash = self.hash_password(mot_de_passe)
+            
+            cursor.execute('''
+                INSERT INTO utilisateurs 
+                (nom, email, telephone, mot_de_passe, role, entreprise)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (nom, email, telephone, mot_de_passe_hash, role, entreprise))
+            
+            conn.commit()
+            user_id = cursor.lastrowid
+            conn.close()
+            
+            return {
+                'success': True,
+                'message': f'Utilisateur {nom} créé avec succès',
+                'user_id': user_id
+            }
+        except sqlite3.IntegrityError:
+            return {
+                'success': False,
+                'message': 'Cet email existe déjà'
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Erreur: {str(e)}'
+            }
+    
+    def authentifier(self, email: str, mot_de_passe: str) -> Dict:
+        """Authentifier un utilisateur"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            mot_de_passe_hash = self.hash_password(mot_de_passe)
+            
+            cursor.execute('''
+                SELECT id, nom, role, entreprise FROM utilisateurs
+                WHERE email = ? AND mot_de_passe = ? AND actif = 1
+            ''', (email, mot_de_passe_hash))
+            
+            user = cursor.fetchone()
+            conn.close()
+            
+            if user:
+                return {
+                    'success': True,
+                    'user_id': user[0],
+                    'nom': user[1],
+                    'role': user[2],
+                    'entreprise': user[3]
+                }
+            else:
+                return {
+                    'success': False,
+                    'message': 'Email ou mot de passe incorrect'
+                }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Erreur: {str(e)}'
+            }
+    
+    def lister_utilisateurs(self) -> List[Dict]:
+        """Lister tous les utilisateurs"""
+        try:
+            conn = self.db.get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT id, nom, email, telephone, role, entreprise, actif
+                FROM utilisateurs
+                ORDER BY date_creation DESC
+            ''')
+            
+            utilisateurs = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return utilisateurs
+        except Exception as e:
+            print(f"Erreur: {e}")
+            return []
+
+# ============================================
+# 3. GESTION DES PRODUITS
+# ============================================
+
+class ProduitManager:
+    """Gestion des produits"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+    
+    def ajouter_produit(self, code_produit: str, nom: str, prix_achat: float,
+                       prix_vente: float, categorie: str = '', 
+                       quantite_min: int = 5, quantite_max: int = 100,
+                       description: str = '') -> Dict:
+        """Ajouter un nouveau produit"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO produits
+                (code_produit, nom, description, categorie, prix_achat, 
+                 prix_vente, quantite_min, quantite_max)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (code_produit, nom, description, categorie, prix_achat,
+                  prix_vente, quantite_min, quantite_max))
+            
+            conn.commit()
+            product_id = cursor.lastrowid
+            conn.close()
+            
+            return {
+                'success': True,
+                'message': f'Produit {nom} ajouté avec succès',
+                'product_id': product_id
+            }
+        except sqlite3.IntegrityError:
+            return {
+                'success': False,
+                'message': f'Le code produit {code_produit} existe déjà'
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Erreur: {str(e)}'
+            }
+    
+    def modifier_produit(self, produit_id: int, **kwargs) -> Dict:
+        """Modifier les informations d'un produit"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            # Construire la requête UPDATE dynamiquement
+            colonnes = ', '.join([f'{key} = ?' for key in kwargs.keys()])
+            valeurs = list(kwargs.values()) + [produit_id]
+            
+            cursor.execute(f'''
+                UPDATE produits
+                SET {colonnes}, date_modification = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', valeurs)
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                'success': True,
+                'message': 'Produit modifié avec succès'
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Erreur: {str(e)}'
+            }
+    
+    def obtenir_produit(self, produit_id: int) -> Optional[Dict]:
+        """Obtenir les détails d'un produit"""
+        try:
+            conn = self.db.get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT * FROM produits WHERE id = ?
+            ''', (produit_id,))
+            
+            produit = cursor.fetchone()
+            conn.close()
+            
+            return dict(produit) if produit else None
+        except Exception as e:
+            print(f"Erreur: {e}")
+            return None
+    
+    def lister_produits(self, categorie: str = '', actifs_seulement: bool = True) -> List[Dict]:
+        """Lister tous les produits"""
+        try:
+            conn = self.db.get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            if categorie:
+                cursor.execute('''
+                    SELECT * FROM produits
+                    WHERE categorie = ? AND actif = ?
+                    ORDER BY nom
+                ''', (categorie, 1 if actifs_seulement else 1))
+            else:
+                cursor.execute('''
+                    SELECT * FROM produits
+                    WHERE actif = ?
+                    ORDER BY nom
+                ''', (1 if actifs_seulement else 1,))
+            
+            produits = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return produits
+        except Exception as e:
+            print(f"Erreur: {e}")
+            return []
+    
+    def rechercher_produit(self, terme: str) -> List[Dict]:
+        """Rechercher des produits par nom ou code"""
+        try:
+            conn = self.db.get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            terme = f'%{terme}%'
+            cursor.execute('''
+                SELECT * FROM produits
+                WHERE (nom LIKE ? OR code_produit LIKE ?) AND actif = 1
+                ORDER BY nom
+            ''', (terme, terme))
+            
+            produits = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return produits
+        except Exception as e:
+            print(f"Erreur: {e}")
+            return []
+
+# ============================================
+# 4. GESTION DU STOCK
+# ============================================
+
+class StockManager:
+    """Gestion du stock et des mouvements"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+    
+    def ajouter_stock(self, produit_id: int, quantite: int, 
+                     prix_unitaire: float = 0, utilisateur_id: int = 0,
+                     raison: str = 'Entrée manuelle', reference: str = '') -> Dict:
+        """Ajouter du stock (achat, retour, etc.)"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            # Enregistrer le mouvement
+            cursor.execute('''
+                INSERT INTO mouvements_stock
+                (produit_id, type_mouvement, quantite, prix_unitaire, 
+                 utilisateur_id, raison, reference)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (produit_id, 'ENTREE', quantite, prix_unitaire, 
+                  utilisateur_id, raison, reference))
+            
+            # Mettre à jour le stock du produit
+            cursor.execute('''
+                UPDATE produits
+                SET quantite_stock = quantite_stock + ?
+                WHERE id = ?
+            ''', (quantite, produit_id))
+            
+            # Vérifier les alertes
+            self._verifier_alertes(cursor, produit_id)
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                'success': True,
+                'message': f'{quantite} unités ajoutées au stock'
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Erreur: {str(e)}'
+            }
+    
+    def retirer_stock(self, produit_id: int, quantite: int, 
+                     utilisateur_id: int = 0, raison: str = 'Vente',
+                     reference: str = '') -> Dict:
+        """Retirer du stock (vente, perte, etc.)"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            # Vérifier la disponibilité
+            cursor.execute('SELECT quantite_stock FROM produits WHERE id = ?', 
+                          (produit_id,))
+            result = cursor.fetchone()
+            
+            if not result or result[0] < quantite:
+                conn.close()
+                return {
+                    'success': False,
+                    'message': 'Stock insuffisant'
+                }
+            
+            # Enregistrer le mouvement
+            cursor.execute('''
+                INSERT INTO mouvements_stock
+                (produit_id, type_mouvement, quantite, utilisateur_id, raison, reference)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (produit_id, 'SORTIE', quantite, utilisateur_id, raison, reference))
+            
+            # Mettre à jour le stock
+            cursor.execute('''
+                UPDATE produits
+                SET quantite_stock = quantite_stock - ?
+                WHERE id = ?
+            ''', (quantite, produit_id))
+            
+            # Vérifier les alertes
+            self._verifier_alertes(cursor, produit_id)
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                'success': True,
+                'message': f'{quantite} unités retirées du stock'
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Erreur: {str(e)}'
+            }
+    
+    def obtenir_mouvements(self, produit_id: int = None, 
+                          limite: int = 50) -> List[Dict]:
+        """Obtenir l'historique des mouvements"""
+        try:
+            conn = self.db.get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            if produit_id:
+                cursor.execute('''
+                    SELECT m.*, p.nom as produit_nom, u.nom as utilisateur_nom
+                    FROM mouvements_stock m
+                    LEFT JOIN produits p ON m.produit_id = p.id
+                    LEFT JOIN utilisateurs u ON m.utilisateur_id = u.id
+                    WHERE m.produit_id = ?
+                    ORDER BY m.date_mouvement DESC
+                    LIMIT ?
+                ''', (produit_id, limite))
+            else:
+                cursor.execute('''
+                    SELECT m.*, p.nom as produit_nom, u.nom as utilisateur_nom
+                    FROM mouvements_stock m
+                    LEFT JOIN produits p ON m.produit_id = p.id
+                    LEFT JOIN utilisateurs u ON m.utilisateur_id = u.id
+                    ORDER BY m.date_mouvement DESC
+                    LIMIT ?
+                ''', (limite,))
+            
+            mouvements = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return mouvements
+        except Exception as e:
+            print(f"Erreur: {e}")
+            return []
+    
+    def _verifier_alertes(self, cursor, produit_id: int):
+        """Vérifier et créer les alertes de stock"""
+        cursor.execute('''
+            SELECT id, quantite_stock, quantite_min, quantite_max, nom
+            FROM produits WHERE id = ?
+        ''', (produit_id,))
+        
+        produit = cursor.fetchone()
+        if not produit:
+            return
+        
+        id_prod, quantite, quantite_min, quantite_max, nom = produit
+        
+        # Alerte stock minimum
+        if quantite <= quantite_min:
+            cursor.execute('''
+                INSERT INTO alertes_stock
+                (produit_id, type_alerte, quantite_actuelle, seuil)
+                VALUES (?, ?, ?, ?)
+            ''', (produit_id, 'STOCK_FAIBLE', quantite, quantite_min))
+        
+        # Alerte surstock
+        if quantite > quantite_max:
+            cursor.execute('''
+                INSERT INTO alertes_stock
+                (produit_id, type_alerte, quantite_actuelle, seuil)
+                VALUES (?, ?, ?, ?)
+            ''', (produit_id, 'SURSTOCK', quantite, quantite_max))
+
+# ============================================
+# 5. GESTION DES VENTES
+# ============================================
+
+class VenteManager:
+    """Gestion des ventes"""
+    
+    def __init__(self, db_manager: DatabaseManager, stock_manager: StockManager):
+        self.db = db_manager
+        self.stock = stock_manager
+    
+    def creer_vente(self, client_nom: str, utilisateur_id: int, 
+                   client_contact: str = '', notes: str = '') -> Dict:
+        """Créer une nouvelle vente"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            # Générer numéro de facture unique
+            numero_facture = self._generer_numero_facture(cursor)
+            
+            cursor.execute('''
+                INSERT INTO ventes
+                (numero_facture, client_nom, client_contact, utilisateur_id, notes)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (numero_facture, client_nom, client_contact, utilisateur_id, notes))
+            
+            vente_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
+            
+            return {
+                'success': True,
+                'message': 'Vente créée',
+                'vente_id': vente_id,
+                'numero_facture': numero_facture
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Erreur: {str(e)}'
+            }
+    
+    def ajouter_article_vente(self, vente_id: int, produit_id: int, 
+                            quantite: int) -> Dict:
+        """Ajouter un article à une vente"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            # Obtenir le prix de vente du produit
+            cursor.execute('''
+                SELECT prix_vente, quantite_stock FROM produits WHERE id = ?
+            ''', (produit_id,))
+            
+            result = cursor.fetchone()
+            if not result:
+                conn.close()
+                return {
+                    'success': False,
+                    'message': 'Produit introuvable'
+                }
+            
+            prix_vente, quantite_stock = result
+            
+            if quantite_stock < quantite:
+                conn.close()
+                return {
+                    'success': False,
+                    'message': 'Stock insuffisant'
+                }
+            
+            montant = prix_vente * quantite
+            
+            cursor.execute('''
+                INSERT INTO details_ventes
+                (vente_id, produit_id, quantite, prix_unitaire, montant)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (vente_id, produit_id, quantite, prix_vente, montant))
+            
+            # Mettre à jour le montant total de la vente
+            cursor.execute('''
+                UPDATE ventes
+                SET montant_total = (
+                    SELECT SUM(montant) FROM details_ventes WHERE vente_id = ?
+                )
+                WHERE id = ?
+            ''', (vente_id, vente_id))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                'success': True,
+                'message': 'Article ajouté à la vente'
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Erreur: {str(e)}'
+            }
+    
+    def finaliser_vente(self, vente_id: int, montant_paye: float = 0) -> Dict:
+        """Finaliser une vente et mettre à jour le stock"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            # Obtenir les détails de la vente
+            cursor.execute('''
+                SELECT * FROM details_ventes WHERE vente_id = ?
+            ''', (vente_id,))
+            
+            details = cursor.fetchall()
+            
+            # Mettre à jour le stock pour chaque produit
+            for detail in details:
+                _, _, produit_id, quantite, _, _ = detail
+                self.stock.retirer_stock(produit_id, quantite, 
+                                        raison='Vente', reference=f'VTE_{vente_id}')
+            
+            # Mettre à jour le statut de la vente
+            cursor.execute('''
+                UPDATE ventes
+                SET statut = ?, montant_paye = ?
+                WHERE id = ?
+            ''', ('completee' if montant_paye > 0 else 'en_cours', montant_paye, vente_id))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                'success': True,
+                'message': 'Vente finalisée avec succès'
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Erreur: {str(e)}'
+            }
+    
+    def obtenir_vente(self, vente_id: int) -> Optional[Dict]:
+        """Obtenir les détails d'une vente"""
+        try:
+            conn = self.db.get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT * FROM ventes WHERE id = ?
+            ''', (vente_id,))
+            
+            vente = cursor.fetchone()
+            if vente:
+                vente = dict(vente)
+                
+                # Obtenir les articles
+                cursor.execute('''
+                    SELECT dv.*, p.nom as produit_nom, p.code_produit
+                    FROM details_ventes dv
+                    LEFT JOIN produits p ON dv.produit_id = p.id
+                    WHERE dv.vente_id = ?
+                ''', (vente_id,))
+                
+                vente['articles'] = [dict(row) for row in cursor.fetchall()]
+            
+            conn.close()
+            return vente
+        except Exception as e:
+            print(f"Erreur: {e}")
+            return None
+    
+    def lister_ventes(self, date_debut: str = '', date_fin: str = '') -> List[Dict]:
+        """Lister les ventes"""
+        try:
+            conn = self.db.get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            if date_debut and date_fin:
+                cursor.execute('''
+                    SELECT v.*, u.nom as utilisateur_nom
+                    FROM ventes v
+                    LEFT JOIN utilisateurs u ON v.utilisateur_id = u.id
+                    WHERE DATE(v.date_vente) BETWEEN ? AND ?
+                    ORDER BY v.date_vente DESC
+                ''', (date_debut, date_fin))
+            else:
+                cursor.execute('''
+                    SELECT v.*, u.nom as utilisateur_nom
+                    FROM ventes v
+                    LEFT JOIN utilisateurs u ON v.utilisateur_id = u.id
+                    ORDER BY v.date_vente DESC
+                    LIMIT 100
+                ''')
+            
+            ventes = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return ventes
+        except Exception as e:
+            print(f"Erreur: {e}")
+            return []
+    
+    def _generer_numero_facture(self, cursor) -> str:
+        """Générer un numéro de facture unique"""
+        date = datetime.now().strftime('%Y%m%d')
+        cursor.execute('''
+            SELECT COUNT(*) FROM ventes
+            WHERE DATE(date_vente) = ?
+        ''', (datetime.now().date(),))
+        count = cursor.fetchone()[0] + 1
+        return f'FAC-{date}-{count:04d}'
+
+# ============================================
+# 6. GESTION DES ACHATS
+# ============================================
+
+class AchatManager:
+    """Gestion des achats"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+    
+    def creer_achat(self, fournisseur_id: int, utilisateur_id: int) -> Dict:
+        """Créer un bon d'achat"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            numero_bon = self._generer_numero_bon(cursor)
+            
+            cursor.execute('''
+                INSERT INTO achats
+                (numero_bon, fournisseur_id, utilisateur_id)
+                VALUES (?, ?, ?)
+            ''', (numero_bon, fournisseur_id, utilisateur_id))
+            
+            achat_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
+            
+            return {
+                'success': True,
+                'message': 'Bon d\'achat créé',
+                'achat_id': achat_id,
+                'numero_bon': numero_bon
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Erreur: {str(e)}'
+            }
+    
+    def ajouter_article_achat(self, achat_id: int, produit_id: int, 
+                             quantite: int, prix_unitaire: float) -> Dict:
+        """Ajouter un article à un bon d'achat"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            montant = quantite * prix_unitaire
+            
+            cursor.execute('''
+                INSERT INTO details_achats
+                (achat_id, produit_id, quantite, prix_unitaire, montant)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (achat_id, produit_id, quantite, prix_unitaire, montant))
+            
+            # Mettre à jour le montant total
+            cursor.execute('''
+                UPDATE achats
+                SET montant_total = (
+                    SELECT SUM(montant) FROM details_achats WHERE achat_id = ?
+                )
+                WHERE id = ?
+            ''', (achat_id, achat_id))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                'success': True,
+                'message': 'Article ajouté'
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Erreur: {str(e)}'
+            }
+    
+    def recevoir_achat(self, achat_id: int, montant_paye: float = 0) -> Dict:
+        """Réceptionner un achat et ajouter au stock"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            # Obtenir les détails de l'achat
+            cursor.execute('''
+                SELECT * FROM details_achats WHERE achat_id = ?
+            ''', (achat_id,))
+            
+            details = cursor.fetchall()
+            
+            # Ajouter au stock
+            for detail in details:
+                _, _, produit_id, quantite, prix_unitaire, _ = detail
+                cursor.execute('''
+                    INSERT INTO mouvements_stock
+                    (produit_id, type_mouvement, quantite, prix_unitaire, raison, reference)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (produit_id, 'ENTREE', quantite, prix_unitaire, 
+                      'Achat fournisseur', f'ACH_{achat_id}'))
+                
+                cursor.execute('''
+                    UPDATE produits
+                    SET quantite_stock = quantite_stock + ?
+                    WHERE id = ?
+                ''', (quantite, produit_id))
+            
+            # Mettre à jour le statut
+            cursor.execute('''
+                UPDATE achats
+                SET statut = ?, montant_paye = ?, date_livraison = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', ('receptionne', montant_paye, achat_id))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                'success': True,
+                'message': 'Achat réceptionné et stock mis à jour'
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Erreur: {str(e)}'
+            }
+    
+    def _generer_numero_bon(self, cursor) -> str:
+        """Générer un numéro de bon unique"""
+        date = datetime.now().strftime('%Y%m%d')
+        cursor.execute('''
+            SELECT COUNT(*) FROM achats
+            WHERE DATE(date_achat) = ?
+        ''', (datetime.now().date(),))
+        count = cursor.fetchone()[0] + 1
+        return f'BON-{date}-{count:04d}'
+
+# ============================================
+# 7. GESTION DES FOURNISSEURS
+# ============================================
+
+class FournisseurManager:
+    """Gestion des fournisseurs"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+    
+    def ajouter_fournisseur(self, nom: str, contact: str = '', 
+                           telephone: str = '', email: str = '',
+                           adresse: str = '', ville: str = '') -> Dict:
+        """Ajouter un nouveau fournisseur"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO fournisseurs
+                (nom, contact, telephone, email, adresse, ville, pays)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (nom, contact, telephone, email, adresse, ville, 'Cameroun'))
+            
+            conn.commit()
+            fournisseur_id = cursor.lastrowid
+            conn.close()
+            
+            return {
+                'success': True,
+                'message': f'Fournisseur {nom} ajouté',
+                'fournisseur_id': fournisseur_id
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f'Erreur: {str(e)}'
+            }
+    
+    def lister_fournisseurs(self) -> List[Dict]:
+        """Lister tous les fournisseurs"""
+        try:
+            conn = self.db.get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT * FROM fournisseurs
+                ORDER BY nom
+            ''')
+            
+            fournisseurs = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return fournisseurs
+        except Exception as e:
+            print(f"Erreur: {e}")
+            return []
+
+# ============================================
+# 8. RAPPORTS & STATISTIQUES
+# ============================================
+
+class RapportManager:
+    """Génération de rapports et statistiques"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+    
+    def obtenir_tableau_bord(self) -> Dict:
+        """Obtenir les statistiques du tableau de bord"""
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            # Nombre total de produits
+            cursor.execute('SELECT COUNT(*) FROM produits WHERE actif = 1')
+            total_produits = cursor.fetchone()[0]
+            
+            # Valeur totale du stock
+            cursor.execute('''
+                SELECT SUM(quantite_stock * prix_achat) FROM produits WHERE actif = 1
+            ''')
+            valeur_stock = cursor.fetchone()[0] or 0
+            
+            # Produits en rupture
+            cursor.execute('''
+                SELECT COUNT(*) FROM produits WHERE quantite_stock <= quantite_min AND actif = 1
+            ''')
+            produits_rupture = cursor.fetchone()[0]
+            
+            # Ventes du jour
+            cursor.execute('''
+                SELECT SUM(montant_total) FROM ventes
+                WHERE DATE(date_vente) = DATE('now')
+            ''')
+            ventes_jour = cursor.fetchone()[0] or 0
+            
+            # Achats du mois
+            cursor.execute('''
+                SELECT SUM(montant_total) FROM achats
+                WHERE strftime('%Y-%m', date_achat) = strftime('%Y-%m', 'now')
+            ''')
+            achats_mois = cursor.fetchone()[0] or 0
+            
+            # Top 5 produits par ventes
+            cursor.execute('''
+                SELECT p.nom, SUM(dv.quantite) as total_vendu
+                FROM details_ventes dv
+                LEFT JOIN produits p ON dv.produit_id = p.id
+                GROUP BY dv.produit_id
+                ORDER BY total_vendu DESC
+                LIMIT 5
+            ''')
+            top_produits = [{'nom': row[0], 'quantite': row[1]} for row in cursor.fetchall()]
+            
+            # Alertes de stock
+            cursor.execute('''
+                SELECT p.nom, p.quantite_stock, p.quantite_min, a.type_alerte
+                FROM alertes_stock a
+                LEFT JOIN produits p ON a.produit_id = p.id
+                WHERE a.resolue = 0
+                ORDER BY a.date_alerte DESC
+                LIMIT 10
+            ''')
+            alertes = [{'produit': row[0], 'quantite': row[1], 
+                       'minimum': row[2], 'type': row[3]} for row in cursor.fetchall()]
+            
+            conn.close()
+            
+            return {
+                'total_produits': total_produits,
+                'valeur_stock': round(valeur_stock, 2),
+                'produits_rupture': produits_rupture,
+                'ventes_jour': round(ventes_jour, 2),
+                'achats_mois': round(achats_mois, 2),
+                'top_produits': top_produits,
+                'alertes': alertes
+            }
+        except Exception as e:
+            print(f"Erreur: {e}")
+            return {}
+    
+    def rapport_stock(self, date_debut: str = '', date_fin: str = '') -> Dict:
+        """Générer un rapport de stock"""
+        try:
+            conn = self.db.get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT 
+                    p.code_produit,
+                    p.nom,
+                    p.quantite_stock,
+                    p.quantite_min,
+                    p.quantite_max,
+                    p.prix_achat,
+                    p.prix_vente,
+                    (p.quantite_stock * p.prix_achat) as valeur_stock
+                FROM produits p
+                WHERE p.actif = 1
+                ORDER BY p.nom
+            ''')
+            
+            produits = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            
+            return {
+                'date_generation': datetime.now().isoformat(),
+                'produits': produits,
+                'total_produits': len(produits),
+                'valeur_totale': sum([p['valeur_stock'] or 0 for p in produits])
+            }
+        except Exception as e:
+            print(f"Erreur: {e}")
+            return {}
+    
+    def rapport_ventes(self, date_debut: str = '', date_fin: str = '') -> Dict:
+        """Générer un rapport de ventes"""
+        try:
+            conn = self.db.get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            if date_debut and date_fin:
+                cursor.execute('''
+                    SELECT 
+                        v.numero_facture,
+                        v.client_nom,
+                        v.date_vente,
+                        v.montant_total,
+                        v.montant_paye,
+                        v.statut,
+                        u.nom as vendeur
+                    FROM ventes v
+                    LEFT JOIN utilisateurs u ON v.utilisateur_id = u.id
+                    WHERE DATE(v.date_vente) BETWEEN ? AND ?
+                    ORDER BY v.date_vente DESC
+                ''', (date_debut, date_fin))
+            else:
+                cursor.execute('''
+                    SELECT 
+                        v.numero_facture,
+                        v.client_nom,
+                        v.date_vente,
+                        v.montant_total,
+                        v.montant_paye,
+                        v.statut,
+                        u.nom as vendeur
+                    FROM ventes v
+                    LEFT JOIN utilisateurs u ON v.utilisateur_id = u.id
+                    ORDER BY v.date_vente DESC
+                    LIMIT 100
+                ''')
+            
+            ventes = [dict(row) for row in cursor.fetchall()]
+            total_ventes = sum([v['montant_total'] or 0 for v in ventes])
+            total_paye = sum([v['montant_paye'] or 0 for v in ventes])
+            
+            conn.close()
+            
+            return {
+                'date_generation': datetime.now().isoformat(),
+                'ventes': ventes,
+                'total_ventes': round(total_ventes, 2),
+                'total_paye': round(total_paye, 2),
+                'total_credit': round(total_ventes - total_paye, 2),
+                'nombre_transactions': len(ventes)
+            }
+        except Exception as e:
+            print(f"Erreur: {e}")
+            return {}
+
+# ============================================
+# 9. APPLICATION PRINCIPALE
+# ============================================
+
+class StockManagerApp:
+    """Application principale de gestion de stock"""
+    
+    def __init__(self):
+        self.db = DatabaseManager()
+        self.utilisateur = UtilisateurManager(self.db)
+        self.produit = ProduitManager(self.db)
+        self.stock = StockManager(self.db)
+        self.vente = VenteManager(self.db, self.stock)
+        self.achat = AchatManager(self.db)
+        self.fournisseur = FournisseurManager(self.db)
+        self.rapport = RapportManager(self.db)
+        self.utilisateur_courant = None
+    
+    def demarrer(self):
+        """Démarrer l'application"""
+        print("\n" + "="*60)
+        print("  STOCK MANAGER v1.0 - Par Patenzo Premier")
+        print("  Logiciel de Gestion de Stock")
+        print("  Adapté pour le Cameroun")
+        print("="*60 + "\n")
+
+# ============================================
+# 10. INTERFACE GRAPHIQUE AVEC TKINTER
+# ============================================
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from datetime import datetime, timedelta
+import json
+
+class StockManagerUI:
+    """Interface graphique de Stock Manager"""
+    
+    def __init__(self, root):
+        self.root = root
+        self.app = StockManagerApp()
+        self.app.demarrer()
+        self.utilisateur_courant = None
+        
+        # Configurer la fenêtre principale
+        self.root.title("Stock Manager - Par Patenzo Premier")
+        self.root.geometry("1400x800")
+        
+        # Couleurs personnalisées (style camerounais)
+        self.color_primary = "#1B4965"  # Bleu foncé (couleur du drapeau)
+        self.color_secondary = "#D4A574"  # Or/Jaune
+        self.color_danger = "#E63946"
+        self.color_success = "#2A9D8F"
+        self.color_warning = "#F4A261"
+        
+        # Configurer le style
+        self.configure_styles()
+        
+        # Afficher l'écran de connexion
+        self.show_login_screen()
+    
+    def configure_styles(self):
+        """Configurer les styles de l'application"""
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        # Style principal
+        style.configure('TFrame', background='#F5F5F5')
+        style.configure('TLabel', background='#F5F5F5')
+        style.configure('Title.TLabel', font=('Arial', 16, 'bold'),
+                       background='#F5F5F5')
+        style.configure('Heading.TLabel', font=('Arial', 12, 'bold'),
+                       background='#F5F5F5')
+    
+    def show_login_screen(self):
+        """Afficher l'écran de connexion"""
+        # Nettoyer la fenêtre
+        for widget in self.root.winfo_children():
+            widget.destroy()
+        
+        # Frame principal
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(expand=True, fill='both')
+        
+        # Logo/Titre
+        title_frame = ttk.Frame(main_frame)
+        title_frame.pack(pady=30)
+        
+        title_label = ttk.Label(title_frame, text="📦 STOCK MANAGER",
+                              style='Title.TLabel')
+        title_label.pack()
+        
+        subtitle_label = ttk.Label(title_frame, text="Par Patenzo Premier",
+                                 style='Heading.TLabel')
+        subtitle_label.pack()
+        
+        # Form frame
+        form_frame = ttk.Frame(main_frame)
+        form_frame.pack(padx=20, pady=20)
+        
+        ttk.Label(form_frame, text="Email:").grid(row=0, column=0, sticky='w', padx=10, pady=10)
+        email_entry = ttk.Entry(form_frame, width=30)
+        email_entry.grid(row=0, column=1, padx=10, pady=10)
+        
+        ttk.Label(form_frame, text="Mot de passe:").grid(row=1, column=0, sticky='w', padx=10, pady=10)
+        password_entry = ttk.Entry(form_frame, width=30, show='*')
+        password_entry.grid(row=1, column=1, padx=10, pady=10)
+        
+        # Boutons
+        button_frame = ttk.Frame(form_frame)
+        button_frame.grid(row=2, column=0, columnspan=2, pady=20)
+        
+        def login():
+            email = email_entry.get()
+            password = password_entry.get()
+            
+            if not email or not password:
+                messagebox.showerror("Erreur", "Veuillez remplir tous les champs")
+                return
+            
+            result = self.app.utilisateur.authentifier(email, password)
+            if result['success']:
+                self.utilisateur_courant = result
+                self.show_main_screen()
+            else:
+                messagebox.showerror("Erreur", result['message'])
+        
+        def register():
+            self.show_register_screen()
+        
+        login_btn = ttk.Button(button_frame, text="Connexion", command=login)
+        login_btn.pack(side='left', padx=10)
+        
+        register_btn = ttk.Button(button_frame, text="S'inscrire", command=register)
+        register_btn.pack(side='left', padx=10)
+    
+    def show_register_screen(self):
+        """Afficher l'écran d'inscription"""
+        # Nettoyer la fenêtre
+        for widget in self.root.winfo_children():
+            widget.destroy()
+        
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(expand=True, fill='both', padx=20, pady=20)
+        
+        ttk.Label(main_frame, text="Créer un Compte", style='Title.TLabel').pack(pady=20)
+        
+        # Form frame
+        form_frame = ttk.Frame(main_frame)
+        form_frame.pack(padx=20, pady=20)
+        
+        labels = ['Nom:', 'Email:', 'Téléphone:', 'Entreprise:', 'Mot de passe:']
+        entries = {}
+        
+        for i, label in enumerate(labels):
+            ttk.Label(form_frame, text=label).grid(row=i, column=0, sticky='w', padx=10, pady=10)
+            entry = ttk.Entry(form_frame, width=30)
+            entry.grid(row=i, column=1, padx=10, pady=10)
+            entries[label] = entry
+        
+        def register():
+            nom = entries['Nom:'].get()
+            email = entries['Email:'].get()
+            telephone = entries['Téléphone:'].get()
+            entreprise = entries['Entreprise:'].get()
+            mot_de_passe = entries['Mot de passe:'].get()
+            
+            if not all([nom, email, mot_de_passe]):
+                messagebox.showerror("Erreur", "Veuillez remplir les champs obligatoires")
+                return
+            
+            result 
